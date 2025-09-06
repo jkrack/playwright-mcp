@@ -3,18 +3,17 @@ import { z } from 'zod';
 import { launch } from '@cloudflare/playwright';
 import { createMcpAgent } from '@cloudflare/playwright-mcp';
 
-export const PlaywrightMCP = createMcpAgent(env.BROWSER);
+// Create the base agent class from the library
+const Base: any = createMcpAgent(env.BROWSER);
 
-// Register the tool at module load to avoid race with client "list tools".
-(async () => {
-  try {
-    const conn = await (PlaywrightMCP as unknown as { server: Promise<any> }).server;
-    const srv = conn?.server ?? conn; // support shapes { server } or direct
-    if (srv && typeof srv.tool === 'function') {
-      // Avoid double-registration if hot-reloaded
-      if (!('triflow_smoke_registered' in (srv as any))) {
-        (srv as any).triflow_smoke_registered = true;
-        srv.tool(
+// Extend and register our custom tool during init(), ensuring it exists before tools are listed
+export class PlaywrightMCP extends Base {
+  async init() {
+    try {
+      const server = await (this as any).server; // promise resolved in base class
+      if (server && typeof server.tool === 'function' && !(server as any).__triflow_registered) {
+        (server as any).__triflow_registered = true;
+        server.tool(
           'triflow.smoketest',
           z.object({
             baseUrl: z.string().url().default('https://triflow.ai'),
@@ -27,6 +26,7 @@ export const PlaywrightMCP = createMcpAgent(env.BROWSER);
             const step = (s: string) => steps.push(s);
             try {
               const page = await browser.newPage();
+
               step('Open login');
               await page.goto(`${baseUrl}/login`, { waitUntil: 'load' });
               await page.waitForSelector('#email', { timeout: 20000 });
@@ -114,9 +114,11 @@ export const PlaywrightMCP = createMcpAgent(env.BROWSER);
           }
         );
       }
+    } catch (e) {
+      // swallow tool registration failures to not break the server
     }
-  } catch {}
-})();
+  }
+}
 
 export default {
   fetch(request: Request, env: Env, ctx: ExecutionContext) {
