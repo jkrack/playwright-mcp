@@ -1,131 +1,125 @@
 import { env } from 'cloudflare:workers';
 import { z } from 'zod';
-import playwright, { launch } from '@cloudflare/playwright';
+import { launch } from '@cloudflare/playwright';
 import { createMcpAgent } from '@cloudflare/playwright-mcp';
 
 export const PlaywrightMCP = createMcpAgent(env.BROWSER);
 
-let triFlowToolRegistered = false;
-async function ensureTriFlowTool() {
-  if (triFlowToolRegistered) return;
-  // Access the underlying MCP server instance (promise) from the agent (typed as any)
-  const server = await (PlaywrightMCP as unknown as { server: Promise<any> }).server;
-  if (!server || typeof server.tool !== 'function') return;
+// Register the tool at module load to avoid race with client "list tools".
+(async () => {
+  try {
+    const conn = await (PlaywrightMCP as unknown as { server: Promise<any> }).server;
+    const srv = conn?.server ?? conn; // support shapes { server } or direct
+    if (srv && typeof srv.tool === 'function') {
+      // Avoid double-registration if hot-reloaded
+      if (!('triflow_smoke_registered' in (srv as any))) {
+        (srv as any).triflow_smoke_registered = true;
+        srv.tool(
+          'triflow.smoketest',
+          z.object({
+            baseUrl: z.string().url().default('https://triflow.ai'),
+            email: z.string().email(),
+            password: z.string().min(1)
+          }),
+          async ({ baseUrl, email, password }) => {
+            const browser = await launch(env.BROWSER);
+            const steps: string[] = [];
+            const step = (s: string) => steps.push(s);
+            try {
+              const page = await browser.newPage();
+              step('Open login');
+              await page.goto(`${baseUrl}/login`, { waitUntil: 'load' });
+              await page.waitForSelector('#email', { timeout: 20000 });
+              await page.locator('#email').fill(email);
+              await page.locator('#password').fill(password);
+              step('Submit login');
+              await page.locator('button[type="submit"]').click();
+              await page.waitForURL(/\/dashboard(\/|$)/, { timeout: 30000 }).catch(async () => {
+                await page.goto(`${baseUrl}/dashboard`, { waitUntil: 'load' });
+              });
+              step('Login complete');
 
-  server.tool(
-    'triflow.smoke',
-    z.object({
-      baseUrl: z.string().url().default('https://triflow.ai'),
-      email: z.string().email(),
-      password: z.string().min(1)
-    }),
-    async ({ baseUrl, email, password }) => {
-      const browser = await launch(env.BROWSER);
-      const steps: string[] = [];
-      const step = (s: string) => steps.push(s);
-      try {
-        const page = await browser.newPage();
+              step('Open new opportunity page');
+              await page.goto(`${baseUrl}/dashboard/new-opportunity`, { waitUntil: 'load' });
+              await page.waitForSelector('input[name="name"]', { timeout: 20000 });
+              const stamp = Math.random().toString(36).slice(2, 8);
+              await page.locator('input[name="name"]').fill(`E2E MCP Opportunity ${stamp}`);
+              await page.locator('textarea[name="problem_statement"]').fill(
+                'Users struggle to complete key flows on mobile during peak hours; drop-offs increased 18% QoQ. E2E test.'
+              );
 
-        // 1) Login
-        step('Open login');
-        await page.goto(`${baseUrl}/login`, { waitUntil: 'load' });
-        await page.waitForSelector('#email', { timeout: 20000 });
-        await page.locator('#email').fill(email);
-        await page.locator('#password').fill(password);
-        step('Submit login');
-        await page.locator('button[type="submit"]').click();
-        await page.waitForURL(/\/dashboard(\/|$)/, { timeout: 30000 }).catch(async () => {
-          await page.goto(`${baseUrl}/dashboard`, { waitUntil: 'load' });
-        });
-        step('Login complete');
+              step('Submit analyze with intelligence');
+              await page.locator('button[type="submit"]').click();
+              await page.waitForURL(/\/dashboard\/new-opportunity\/analysis/, { timeout: 60000 }).catch(() => null);
+              const finalUrl = page.url();
+              if (!finalUrl.includes('/dashboard/new-opportunity/analysis')) {
+                const shot = await page.screenshot({ fullPage: true, type: 'png' });
+                return {
+                  content: [
+                    { type: 'text', text: JSON.stringify({ ok: false, steps, error: `Did not reach analysis page: ${finalUrl}` }) },
+                    { type: 'image', data: shot, mimeType: 'image/png' }
+                  ]
+                };
+              }
+              step('Reached analysis page');
+              const urlObj = new URL(finalUrl);
+              const opportunityId = urlObj.searchParams.get('opportunityId') || '';
+              if (!opportunityId) {
+                const shot = await page.screenshot({ fullPage: true, type: 'png' });
+                return {
+                  content: [
+                    { type: 'text', text: JSON.stringify({ ok: false, steps, error: 'Missing opportunityId' }) },
+                    { type: 'image', data: shot, mimeType: 'image/png' }
+                  ]
+                };
+              }
 
-        // 2) Create new opportunity
-        step('Open new opportunity page');
-        await page.goto(`${baseUrl}/dashboard/new-opportunity`, { waitUntil: 'load' });
-        await page.waitForSelector('input[name="name"]', { timeout: 20000 });
+              const hypothesesUrl = `${baseUrl}/dashboard/new-opportunity/analysis/hypotheses?opportunityId=${encodeURIComponent(opportunityId)}`;
+              step('Open hypotheses page');
+              await page.goto(hypothesesUrl, { waitUntil: 'load' });
 
-        const stamp = Math.random().toString(36).slice(2, 8);
-        await page.locator('input[name="name"]').fill(`E2E MCP Opportunity ${stamp}`);
-        await page.locator('textarea[name="problem_statement"]').fill(
-          'Users struggle to complete key flows on mobile during peak hours; drop-offs increased 18% QoQ. E2E test.'
+              const addFirst = page.getByRole('button', { name: 'Add First Hypothesis' });
+              const addHyp = page.getByRole('button', { name: 'Add Hypothesis' });
+              if (await addFirst.isVisible().catch(() => false)) {
+                step('Click Add First Hypothesis');
+                await addFirst.click();
+                await page.waitForResponse((res) => res.url().includes('/api/opportunities/') && res.request().method() === 'POST', { timeout: 60000 }).catch(() => null);
+                await page.reload({ waitUntil: 'load' }).catch(() => null);
+              } else if (await addHyp.isVisible().catch(() => false)) {
+                step('Click Add Hypothesis');
+                await addHyp.click();
+                await page.waitForResponse((res) => res.url().includes('/api/opportunities/') && res.request().method() === 'POST', { timeout: 60000 }).catch(() => null);
+                await page.reload({ waitUntil: 'load' }).catch(() => null);
+              } else {
+                step('No add button found; checking existing hypotheses');
+              }
+
+              step('Verify hypotheses visible');
+              const rows = await page.locator('table tbody tr').count();
+              const cards = await page.getByRole('heading', { name: /Hypothesis/i }).count();
+              const ok = rows > 0 || cards > 0;
+              const shot = await page.screenshot({ fullPage: true, type: 'png' });
+              return {
+                content: [
+                  { type: 'text', text: JSON.stringify({ ok, steps, opportunityId }) },
+                  { type: 'image', data: shot, mimeType: 'image/png' }
+                ]
+              };
+            } catch (e) {
+              const err = e instanceof Error ? e.message : String(e);
+              return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: err }) }] };
+            } finally {
+              try { await browser.close(); } catch {}
+            }
+          }
         );
-
-        step('Submit analyze with intelligence');
-        await page.locator('button[type="submit"]').click();
-        await page.waitForURL(/\/dashboard\/new-opportunity\/analysis/, { timeout: 60000 }).catch(() => null);
-
-        const finalUrl = page.url();
-        if (!finalUrl.includes('/dashboard/new-opportunity/analysis')) {
-          const shot = await page.screenshot({ fullPage: true, type: 'png' });
-          return {
-            content: [
-              { type: 'text', text: JSON.stringify({ ok: false, steps, error: `Did not reach analysis page: ${finalUrl}` }) },
-              { type: 'image', data: shot, mimeType: 'image/png' }
-            ]
-          };
-        }
-        step('Reached analysis page');
-
-        const urlObj = new URL(finalUrl);
-        const opportunityId = urlObj.searchParams.get('opportunityId') || '';
-        if (!opportunityId) {
-          const shot = await page.screenshot({ fullPage: true, type: 'png' });
-          return {
-            content: [
-              { type: 'text', text: JSON.stringify({ ok: false, steps, error: 'Missing opportunityId' }) },
-              { type: 'image', data: shot, mimeType: 'image/png' }
-            ]
-          };
-        }
-
-        // 3) Hypotheses page
-        const hypothesesUrl = `${baseUrl}/dashboard/new-opportunity/analysis/hypotheses?opportunityId=${encodeURIComponent(opportunityId)}`;
-        step('Open hypotheses page');
-        await page.goto(hypothesesUrl, { waitUntil: 'load' });
-
-        // 4) Add first hypothesis / add hypothesis
-        const addFirst = page.getByRole('button', { name: 'Add First Hypothesis' });
-        const addHyp = page.getByRole('button', { name: 'Add Hypothesis' });
-        if (await addFirst.isVisible().catch(() => false)) {
-          step('Click Add First Hypothesis');
-          await addFirst.click();
-          await page.waitForResponse((res) => res.url().includes('/api/opportunities/') && res.request().method() === 'POST', { timeout: 60000 }).catch(() => null);
-          await page.reload({ waitUntil: 'load' }).catch(() => null);
-        } else if (await addHyp.isVisible().catch(() => false)) {
-          step('Click Add Hypothesis');
-          await addHyp.click();
-          await page.waitForResponse((res) => res.url().includes('/api/opportunities/') && res.request().method() === 'POST', { timeout: 60000 }).catch(() => null);
-          await page.reload({ waitUntil: 'load' }).catch(() => null);
-        } else {
-          step('No add button found; checking existing hypotheses');
-        }
-
-        // 5) Verify hypotheses visible
-        step('Verify hypotheses visible');
-        const rows = await page.locator('table tbody tr').count();
-        const cards = await page.getByRole('heading', { name: /Hypothesis/i }).count();
-        const ok = rows > 0 || cards > 0;
-        const shot = await page.screenshot({ fullPage: true, type: 'png' });
-        return {
-          content: [
-            { type: 'text', text: JSON.stringify({ ok, steps, opportunityId }) },
-            { type: 'image', data: shot, mimeType: 'image/png' }
-          ]
-        };
-      } catch (e) {
-        const err = e instanceof Error ? e.message : String(e);
-        return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: err }) }] };
-      } finally {
-        try { await browser.close(); } catch {}
       }
     }
-  );
-  triFlowToolRegistered = true;
-}
+  } catch {}
+})();
 
 export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext) {
-    await ensureTriFlowTool();
+  fetch(request: Request, env: Env, ctx: ExecutionContext) {
     const { pathname }  = new URL(request.url);
 
     switch (pathname) {
