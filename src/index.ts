@@ -1,6 +1,6 @@
 import { env } from 'cloudflare:workers';
 import { z } from 'zod';
-import { chromium } from '@cloudflare/playwright';
+import playwright, { launch } from '@cloudflare/playwright';
 import { createMcpAgent } from '@cloudflare/playwright-mcp';
 
 export const PlaywrightMCP = createMcpAgent(env.BROWSER);
@@ -20,7 +20,7 @@ async function ensureTriFlowTool() {
       password: z.string().min(1)
     }),
     async ({ baseUrl, email, password }) => {
-      const browser = await chromium.launch(env.BROWSER);
+      const browser = await launch(env.BROWSER);
       const steps: string[] = [];
       const step = (s: string) => steps.push(s);
       try {
